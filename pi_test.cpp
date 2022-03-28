@@ -1,0 +1,200 @@
+#include "LabeledHE/labeled_he.h"
+#include "labeled_he_control.h"
+#include "joye_libert_journal/joye_libert.h"
+
+#include <gmp.h>
+#include <iostream>
+#include <chrono>
+#include <unistd.h>
+
+int main()
+{
+	std::cout << "Hello World\n";
+
+	// Declare control parameters
+	// NB! Gain in proportional and
+	// integral part must be the same. I.e.,
+	// if we scale the timestamp, we must compensate by
+	// scaling Kp.
+	mpz_t kp, ki;
+	mpz_init_set_ui(kp, 500); // Kp = 5, scaled by 100
+	mpz_init_set_ui(ki, 1); // Ki = 1, not scaled
+
+	// Declare cryptographic parameters
+	mpz_t N, y, p, ptspace, half_ptspace;
+	mpz_init(N);
+	mpz_init(y);
+	mpz_init(p);
+	mpz_init(ptspace);
+	mpz_init(half_ptspace);
+
+	gmp_randstate_t state;
+	gmp_randinit_mt(state);
+
+	uint32_t keysize = 2048;
+	uint32_t msgsize = 32;
+
+	mpz_ui_pow_ui(ptspace, 2, msgsize);
+	mpz_ui_pow_ui(half_ptspace, 2, msgsize-1);
+	
+	std::cout << "Generating appropriate keys - this may take a while.\n";
+	he_keygen(N, y, p, msgsize, keysize);
+
+	hc128_state hc_cs;
+        uint8_t hc_key[16] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                              0x08, 0x09, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15};
+        uint8_t hc_iv[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+	hc128_initialize(&hc_cs, hc_key, hc_iv);
+
+	// HE Encryption Labels
+	mpz_t kp_label, ki_label, e_label, time_label;
+	mpz_init_set_ui(kp_label, 1);
+	mpz_init_set_ui(ki_label, 4);
+	mpz_init_set_ui(e_label, 2);
+	mpz_init_set_ui(time_label, 3);
+
+	// HE Encryption output
+	mpz_t b_kp, b_ki, b_e, b_t;
+	mpz_init(b_kp);
+	mpz_init(b_ki);
+	mpz_init(b_e);
+	mpz_init(b_t);
+
+	// HE Ciphertext output
+	he_ct c_kp, c_ki, c_e, c_t;
+
+	// Encrypted Control Output
+	mpz_t c_u, c_u_test;
+	mpz_init(c_u);
+	mpz_init(c_u_test);
+
+	// Encrypt the control parameters
+	he_encrypt(&c_kp, state, &hc_cs, b_kp, kp, y, N, kp_label, msgsize);
+	he_encrypt(&c_ki, state, &hc_cs, b_ki, ki, y, N, ki_label, msgsize);
+
+	// Initialize Homomorphic Proportional-Integral Controller
+	Labeled_he_pi_control he_pi_controller(&c_kp, &c_ki, y, N, msgsize);
+
+	// Decrypted Control Output
+	mpf_t u;
+	mpf_init(u);
+
+	// ASSUME STATE BETWEEN -1 and 1
+	double desirable_state = 10;
+	double current_state = 0;
+	double error;
+	mpz_t error_bar, timestep_bar;
+	mpz_init(error_bar);
+	mpz_init(timestep_bar);
+
+	// Integral component is stateful:
+	mpz_t b_int;
+	mpz_init(b_int);
+	int is_init = 0;
+	// Get initial timepoint, map to b_t_prev
+	auto prev_tp = std::chrono::system_clock::now();
+	mpz_t b_t_prev;
+	mpz_init(b_t_prev);
+
+	for (int i = 0; i < 1000; i++)
+	{
+		// Switch sign of desired state every 250 samples
+		if ( (i != 0) && (i % 250 == 0) )
+		{
+			std::cout << "\n\nFLIPPING DESIRABLE STATE\n\n";
+			desirable_state = -desirable_state;
+		}
+
+		// Sleep for 0.1 second
+		usleep(100000);
+		// Get current time, and find delta t:
+		auto sample_tp = std::chrono::system_clock::now();
+		std::chrono::duration<float> ts = sample_tp - prev_tp;
+		float timestep = ts.count();
+		prev_tp = sample_tp;
+
+		// Map timestep to non-negative integer!
+		timestep = timestep*100;// Scaled by 100
+		mpz_set_d(timestep_bar, timestep);
+		mpz_mod(timestep_bar, timestep_bar, ptspace);
+		he_encrypt(&c_t, state, &hc_cs, b_t, timestep_bar, y, N, time_label, msgsize);
+
+		// Find state error
+		error = desirable_state - current_state;
+
+		// Map error to non-negative integer!
+		error = error * 100000; // Scaled by 100 000
+		mpz_set_d(error_bar, error);
+		mpz_mod(error_bar, error_bar, ptspace);
+		
+		// Encrypt the error
+		he_encrypt(&c_e, state, &hc_cs, b_e, error_bar, y, N, e_label, msgsize);
+		
+		// Compute betait, betaie, betate
+		mpz_t betait, betaie, betate;
+		mpz_init(betait);
+		mpz_init(betaie);
+		mpz_init(betate);
+		mpz_mul(betait, b_ki, b_t);
+		mpz_mod(betait, betait, ptspace);
+		mpz_mul(betaie, b_ki, b_e);
+		mpz_mod(betaie, betaie, ptspace);
+		mpz_mul(betate, b_t, b_e);
+		mpz_mod(betate, betate, ptspace);
+		joye_libert_encrypt(betait, state, betait, y, N, msgsize);
+		joye_libert_encrypt(betaie, state, betaie, y, N, msgsize);
+		joye_libert_encrypt(betate, state, betate, y, N, msgsize);
+		
+		he_pi_controller.iterate(c_u, &c_t, &c_e, betait, betaie, betate);
+
+		mpz_t u_bar, u_bar_test, b_u, b_prop;
+		mpz_init(u_bar);;
+		mpz_init(b_u);
+		mpz_init(b_prop);
+
+		// Compute the integral part
+		mpz_t b_tmp_int;
+		mpz_init(b_tmp_int);
+		mpz_mul(b_tmp_int, b_t, b_ki);
+		mpz_mod(b_tmp_int, b_tmp_int, ptspace);
+		mpz_mul(b_tmp_int, b_tmp_int, b_e);
+		mpz_mod(b_tmp_int, b_tmp_int, ptspace);
+		// Add new element to sum
+		mpz_add(b_int, b_int, b_tmp_int);
+		mpz_mod(b_int, b_int, ptspace);
+
+		// Compute proportional part
+		mpz_mul(b_prop, b_kp, b_e);
+		mpz_mod(b_prop, b_prop, ptspace);
+		
+		// Add proportional and integral parts
+		mpz_add(b_u, b_prop, b_int);
+		mpz_mod(b_u, b_u, ptspace);
+
+		// Recover the control input
+		he_decrypt(u_bar, c_u, b_u, p, y, msgsize);
+
+		// Map u_bar to correct interval
+		mpz_t test;
+		mpz_init(test);
+		mpz_sub(test, u_bar, half_ptspace);
+		// If test is non-negative, then we got a negative number
+		if ( mpz_sgn(test) != -1 )
+		{
+			mpz_sub(u_bar, u_bar, ptspace);
+		}
+		mpf_set_z(u, u_bar);
+
+		// Cumulative scaling is 10 000 000
+		mpf_div_ui(u, u, 10000000);
+
+		current_state = 0.9*current_state + 0.1*(mpf_get_d(u));
+		std::cout << "Desired state: " << desirable_state << std::endl;
+		std::cout << "Current state: " << current_state << std::endl;
+
+		mpz_set(b_t_prev, b_t);
+		mpz_add_ui(time_label, time_label, 1);
+	}
+}
