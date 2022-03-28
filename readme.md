@@ -1,11 +1,11 @@
 ***********************************************************
 
 This repository contains code for encrypted PID controllers
-implemented with labeled homomorphic encryption, the Joye-
-Libert Cryptosystem, and the HC-128 stream cipher.
+implemented with labeled homomorphic encryption, the Joye-Libert
+Cryptosystem, and the HC-128 stream cipher.
 
 The implementations of HC-128, Joye-Libert, and labeled
-homomorphic encryption has been taken from the
+homomorphic encryption have been taken from the
 CryptoToolbox repository: https://github.com/pettsol/CryptoToolbox
 
 The implementation requires the GNU Multiple Integer Precision
